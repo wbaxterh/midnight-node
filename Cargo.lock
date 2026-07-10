@@ -8186,6 +8186,7 @@ dependencies = [
  "midnight-primitives",
  "midnight-primitives-beefy",
  "midnight-primitives-cnight-observation",
+ "midnight-primitives-consensus-engine",
  "midnight-primitives-federated-authority-observation",
  "midnight-primitives-session-info",
  "pallet-aura",
@@ -8196,6 +8197,7 @@ dependencies = [
  "pallet-c2m-bridge",
  "pallet-cnight-observation",
  "pallet-collective",
+ "pallet-consensus-engine",
  "pallet-federated-authority",
  "pallet-federated-authority-observation",
  "pallet-grandpa",
@@ -8537,6 +8539,15 @@ dependencies = [
  "sp-inherents",
  "sqlx",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "midnight-primitives-consensus-engine"
+version = "0.1.0"
+dependencies = [
+ "parity-scale-codec",
+ "scale-info",
+ "sp-api",
 ]
 
 [[package]]
@@ -10391,6 +10402,24 @@ dependencies = [
  "log",
  "parity-scale-codec",
  "scale-info",
+ "sp-core",
+ "sp-io",
+ "sp-runtime",
+]
+
+[[package]]
+name = "pallet-consensus-engine"
+version = "0.1.0"
+dependencies = [
+ "frame-support",
+ "frame-system",
+ "log",
+ "midnight-primitives-consensus-engine",
+ "parity-scale-codec",
+ "scale-info",
+ "sp-consensus-aura",
+ "sp-consensus-babe",
+ "sp-consensus-slots",
  "sp-core",
  "sp-io",
  "sp-runtime",
