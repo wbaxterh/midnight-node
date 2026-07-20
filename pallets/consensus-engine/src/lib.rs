@@ -51,6 +51,7 @@ pub mod pallet {
 	use frame_support::ConsensusEngineId;
 	use frame_support::pallet_prelude::*;
 	use frame_support::traits::FindAuthor;
+	use frame_support::traits::OnTimestampSet;
 	use frame_system::pallet_prelude::*;
 	use midnight_primitives_consensus_engine::ActiveEngine;
 	use sp_consensus_aura::digests::CompatibleDigestItem as AuraCompatibleDigestItem;
@@ -304,6 +305,19 @@ pub mod pallet {
 				},
 				ActiveEngine::Babe => {
 					<pallet_babe::Pallet<T> as FindAuthor<u32>>::find_author(digests)
+				},
+			}
+		}
+	}
+
+	impl<T: Config> OnTimestampSet<T::Moment> for Pallet<T> {
+		fn on_timestamp_set(moment: T::Moment) {
+			match Self::active_engine() {
+				ActiveEngine::Aura => {
+					<pallet_aura::Pallet<T> as OnTimestampSet<T::Moment>>::on_timestamp_set(moment)
+				},
+				ActiveEngine::Babe => {
+					<pallet_babe::Pallet<T> as OnTimestampSet<T::Moment>>::on_timestamp_set(moment)
 				},
 			}
 		}
