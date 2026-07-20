@@ -113,7 +113,6 @@ mod mock;
 /// epochs. The epoch length must divide 24h evenly.
 pub const SLOTS_PER_EPOCH: u32 = 300;
 
-mod babe_migrator;
 pub mod beefy;
 pub mod check_call_filter;
 mod constants;
@@ -121,7 +120,6 @@ mod currency;
 mod migrations;
 pub mod weights;
 
-use babe_migrator::BabeMigrator;
 use check_call_filter::CheckCallFilter;
 use constants::time_units::DAYS;
 use pallet_federated_authority::{
@@ -301,12 +299,6 @@ pub const BABE_GENESIS_EPOCH_CONFIG: sp_consensus_babe::BabeEpochConfiguration =
 		allowed_slots: sp_consensus_babe::AllowedSlots::PrimaryAndSecondaryVRFSlots,
 	};
 
-/// Bootstrap randomness for BABE's genesis epoch at the consensus flip. Mirrors
-/// pallet-babe's own genesis default (zero); it is a public, deterministic seed,
-/// not a secure beacon. Real, unbiasable entropy takes over from epoch 1 as VRF
-/// outputs accumulate into `NextRandomness`.
-pub const BABE_GENESIS_RANDOMNESS: sp_consensus_babe::Randomness = [0u8; 32];
-
 /// The version information used to identify this runtime when compiled natively.
 #[cfg(feature = "std")]
 pub fn native_version() -> NativeVersion {
@@ -403,7 +395,9 @@ impl pallet_aura::Config for Runtime {
 }
 
 impl pallet_authorship::Config for Runtime {
-	type FindAuthor = pallet_session::FindAccountFromAuthorIndex<Self, Aura>;
+	// `ConsensusEngine` implements `FindAuthor`, routing author lookup to AURA before
+	// the consensus flip and BABE after it.
+	type FindAuthor = pallet_session::FindAccountFromAuthorIndex<Self, ConsensusEngine>;
 	type EventHandler = ();
 }
 
@@ -952,7 +946,6 @@ impl pallet_consensus_engine::Config for Runtime {
 	// calls as root.
 	type GovernanceOrigin = EnsureRoot<AccountId>;
 	type EpochDuration = SidechainEpochDuration;
-	type BabeMigration = BabeMigrator;
 	// Unit weights for now. Issue #1863.
 	type WeightInfo = ();
 }

@@ -48,41 +48,27 @@ mod tests;
 #[frame_support::pallet]
 pub mod pallet {
 	use crate::WeightInfo;
+	use frame_support::ConsensusEngineId;
 	use frame_support::pallet_prelude::*;
+	use frame_support::traits::FindAuthor;
 	use frame_system::pallet_prelude::*;
 	use midnight_primitives_consensus_engine::ActiveEngine;
-	use sp_consensus_aura::AURA_ENGINE_ID;
-	use sp_consensus_babe::BABE_ENGINE_ID;
+	use sp_consensus_aura::digests::CompatibleDigestItem as AuraCompatibleDigestItem;
+	use sp_consensus_babe::digests::CompatibleDigestItem as _;
 	use sp_consensus_slots::Slot;
 
 	const STORAGE_VERSION: StorageVersion = StorageVersion::new(0);
 
-	/// Binding invoked at the consensus flip to bootstrap `pallet-babe`.
-	///
-	/// The consensus-engine pallet owns *when* the flip happens; the runtime owns
-	/// *how* to bootstrap BABE (its storage and the AURA→BABE key bridge).
-	pub trait BabeMigration {
-		/// Called when BABE is armed, before the node starts emitting BABE
-		/// pre-runtime digests. Pre-seeds `pallet-babe` so its genesis self-init
-		/// (guarded on `GenesisSlot == 0`) never fires while armed, which would
-		/// otherwise deposit a bogus epoch descriptor into a header we can't retract.
-		fn on_arm();
-		/// Bootstrap BABE for its genesis epoch at the flip, given the first slot
-		/// of the new epoch.
-		fn migrate(babe_genesis_slot: Slot);
-	}
-
-	impl BabeMigration for () {
-		fn on_arm() {}
-		fn migrate(_babe_genesis_slot: Slot) {}
-	}
+	/// Bootstrap randomness for BABE's genesis epoch at the consensus flip. Mirrors
+	/// pallet-babe's own genesis default (zero).
+	const BABE_GENESIS_RANDOMNESS: sp_consensus_babe::Randomness = [0u8; 32];
 
 	#[pallet::pallet]
 	#[pallet::storage_version(STORAGE_VERSION)]
 	pub struct Pallet<T>(_);
 
 	#[pallet::config]
-	pub trait Config: frame_system::Config {
+	pub trait Config: frame_system::Config + pallet_aura::Config + pallet_babe::Config {
 		/// Origin permitted to drive state transitions.
 		type GovernanceOrigin: EnsureOrigin<Self::RuntimeOrigin>;
 
@@ -90,10 +76,6 @@ pub mod pallet {
 		/// so they require the same lenght. The flip is performed at an epoch boundary so they stay aligned.
 		#[pallet::constant]
 		type EpochDuration: Get<u64>;
-
-		/// Initializes `pallet-babe` storage when the flip fires. Bound in the
-		/// runtime; `()` for runtimes/tests that do not run BABE.
-		type BabeMigration: BabeMigration;
 
 		/// Weight information for this pallet's extrinsics.
 		type WeightInfo: WeightInfo;
@@ -150,13 +132,13 @@ pub mod pallet {
 			match EngineState::<T>::get() {
 				// Before arming, the node must not emit BABE pre-digests. A block
 				// carrying one would let `pallet-babe` self-initialize its genesis
-				// epoch prematurely (see `BabeMigration::on_arm`), so reject it. This
+				// epoch prematurely (see `arm_babe_storage`), so reject it. This
 				// is deterministic — every node reads the same header — so a
 				// misbehaving author's block is rejected on import, not just locally.
 				State::Aura => {
 					assert!(
-						!Self::has_babe_pre_digest(),
-						"BABE pre-runtime digest present while in state 'Aura'",
+						!Self::has_aura_pre_digest_before_babe_pre_digest(),
+						"Unique BABE pre-runtime digest present after AURA in state 'Aura'",
 					);
 				},
 				State::ScheduledFlip => {
@@ -169,7 +151,7 @@ pub mod pallet {
 				},
 				_ => {},
 			}
-			T::WeightInfo::on_initialize()
+			<T as Config>::WeightInfo::on_initialize()
 		}
 	}
 
@@ -179,13 +161,13 @@ pub mod pallet {
 		///
 		/// Governance-gated. A no-op unless the engine is currently `Aura`.
 		#[pallet::call_index(0)]
-		#[pallet::weight(T::WeightInfo::arm_babe())]
+		#[pallet::weight(<T as Config>::WeightInfo::arm_babe())]
 		pub fn arm_babe(origin: OriginFor<T>) -> DispatchResult {
 			T::GovernanceOrigin::ensure_origin(origin)?;
 			if EngineState::<T>::get() == State::Aura {
 				// Pre-seed BABE before the node starts emitting BABE pre-digests, so
 				// pallet-babe does not prematurely self-initialize its genesis epoch.
-				T::BabeMigration::on_arm();
+				Self::set_sentinel_babe_genesis_slot();
 				EngineState::<T>::put(State::ArmedBabe);
 			}
 			Ok(())
@@ -197,7 +179,7 @@ pub mod pallet {
 		/// The flip itself commits automatically at the next epoch boundary; see
 		/// [`Hooks::on_initialize`].
 		#[pallet::call_index(1)]
-		#[pallet::weight(T::WeightInfo::schedule_flip())]
+		#[pallet::weight(<T as Config>::WeightInfo::schedule_flip())]
 		pub fn schedule_flip(origin: OriginFor<T>) -> DispatchResult {
 			T::GovernanceOrigin::ensure_origin(origin)?;
 			if EngineState::<T>::get() == State::ArmedBabe {
@@ -213,7 +195,18 @@ pub mod pallet {
 			EngineState::<T>::get().active_engine()
 		}
 
-		/// Hand off to the runtime's BABE bootstrap at the flip and log the transition.
+		/// Sets `GenesisSlot` to a non-zero sentinel so pallet-babe's `initialize`
+		/// does not self-initialize a genesis epoch and deposit a bogus `NextEpochData`
+		/// digest into a header we cannot retract.
+		fn set_sentinel_babe_genesis_slot() {
+			pallet_babe::GenesisSlot::<T>::put(Slot::from(u64::MAX));
+			log::info!(
+				target: "consensus-engine",
+				"BABE armed: pre-seeded pallet-babe GenesisSlot to suppress premature genesis init.",
+			);
+		}
+
+		/// Bootstrap `pallet-babe` for its genesis epoch at the flip and log the transition.
 		///
 		/// `slot` is the last slot of the ending epoch (the current block's slot).
 		/// BABE's genesis is the first slot of the next epoch, so its epoch
@@ -221,7 +214,13 @@ pub mod pallet {
 		fn migrate_to_babe(slot: Slot) {
 			let babe_genesis_slot = Self::next_epoch_start(slot);
 
-			T::BabeMigration::migrate(babe_genesis_slot);
+			// BABE and sidechain epochs boundaries should align
+			pallet_babe::GenesisSlot::<T>::put(babe_genesis_slot);
+			pallet_babe::CurrentSlot::<T>::put(babe_genesis_slot);
+			pallet_babe::EpochIndex::<T>::put(0);
+
+			pallet_babe::Randomness::<T>::put(BABE_GENESIS_RANDOMNESS);
+			pallet_babe::NextRandomness::<T>::put(BABE_GENESIS_RANDOMNESS);
 
 			log::info!(
 				target: "consensus-engine",
@@ -230,34 +229,83 @@ pub mod pallet {
 				slot,
 				babe_genesis_slot,
 			);
+
+			// This will prevent each last-of-epoch block to be committeed,
+			// but doesn't stop the chain completly.
+			panic!("Issue #1742 adds BABE keys to the runtime");
 		}
 
 		fn current_slot_from_aura_digest() -> Option<Slot> {
-			frame_system::Pallet::<T>::digest().logs.iter().find_map(|log| {
-				log.as_pre_runtime().and_then(|(id, mut data)| {
-					(id == AURA_ENGINE_ID).then(|| Slot::decode(&mut data).ok()).flatten()
-				})
-			})
-		}
-
-		fn has_babe_pre_digest() -> bool {
 			frame_system::Pallet::<T>::digest()
 				.logs
 				.iter()
-				.filter_map(|log| log.as_pre_runtime())
-				.any(|(id, _)| id == BABE_ENGINE_ID)
+				.find_map(AuraCompatibleDigestItem::<()>::as_aura_pre_digest)
+		}
+
+		/// Returns `true` when the current block's digest carries exactly one BABE
+		/// pre-runtime digest, that digest appears *after* an AURA pre-runtime digest,
+		/// and its slot matches that AURA digest's slot.
+		///
+		/// This is the shape a node emits while still on AURA once it has begun
+		/// signalling BABE secondary slots at the same slot — the situation the
+		/// `State::Aura` guard rejects. Any other arrangement returns `false`: no BABE
+		/// digest, a BABE digest before any AURA digest, a slot mismatch, or more than
+		/// one BABE digest.
+		pub(crate) fn has_aura_pre_digest_before_babe_pre_digest() -> bool {
+			let mut aura_slot = None;
+			let mut babe_present = false;
+			for log in frame_system::Pallet::<T>::digest().logs.iter() {
+				if let Some(slot) = AuraCompatibleDigestItem::<()>::as_aura_pre_digest(log) {
+					aura_slot = Some(slot);
+					continue;
+				};
+
+				if let Some(babe) = log.as_babe_pre_digest() {
+					if let Some(slot) = aura_slot {
+						if babe.slot() != slot {
+							// BABE slot different to AURA slot
+							return false;
+						}
+						if babe_present {
+							// BABE pre-digest is not unique
+							return false;
+						}
+						babe_present = true
+					} else {
+						// BABE pre-digest before AURA
+						return false;
+					}
+				}
+			}
+			babe_present
 		}
 
 		fn is_last_slot_of_epoch(slot: Slot) -> bool {
-			let duration = T::EpochDuration::get().max(1);
+			let duration = <T as Config>::EpochDuration::get().max(1);
 			(u64::from(slot) + 1) % duration == 0
 		}
 
 		/// The first slot of the epoch after the one containing `slot`.
 		fn next_epoch_start(slot: Slot) -> Slot {
-			let duration = T::EpochDuration::get().max(1);
+			let duration = <T as Config>::EpochDuration::get().max(1);
 			let slot = u64::from(slot);
 			Slot::from((slot / duration + 1) * duration)
+		}
+	}
+
+	impl<T: Config> FindAuthor<u32> for Pallet<T> {
+		fn find_author<'a, I>(digests: I) -> Option<u32>
+		where
+			I: 'a + IntoIterator<Item = (ConsensusEngineId, &'a [u8])>,
+		{
+			match Self::active_engine() {
+				ActiveEngine::Aura => {
+					<pallet_aura::Pallet<T> as FindAuthor<u32>>::find_author(digests)
+				},
+				ActiveEngine::Babe => {
+					<pallet_babe::Pallet<T> as FindAuthor<u32>>::find_author(digests)
+				},
+			}
 		}
 	}
 }

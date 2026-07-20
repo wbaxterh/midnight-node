@@ -35,24 +35,86 @@ fn default_state_is_baseline_aura() {
 #[test]
 fn arm_babe_from_baseline() {
 	new_test_ext().execute_with(|| {
-		assert!(!BabeArmed::get());
+		// Before arming, BABE's GenesisSlot is unset (its ValueQuery default of 0).
+		assert_eq!(pallet_babe::GenesisSlot::<Test>::get(), Slot::from(0));
 		assert_ok!(ConsensusEngine::arm_babe(RuntimeOrigin::root()));
 		assert_eq!(EngineState::<Test>::get(), State::ArmedBabe);
-		// Arming pre-seeds BABE so it does not self-initialize prematurely.
-		assert!(BabeArmed::get());
+		// Arming pre-seeds pallet-babe's GenesisSlot to a sentinel so it does not
+		// self-initialize its genesis epoch prematurely.
+		assert_eq!(pallet_babe::GenesisSlot::<Test>::get(), Slot::from(u64::MAX));
 		// `ArmedBabe` still authors with AURA.
 		assert_eq!(ConsensusEngine::active_engine(), ActiveEngine::Aura);
 	});
 }
 
 #[test]
-#[should_panic(expected = "BABE pre-runtime digest present while in state 'Aura'")]
+#[should_panic(expected = "Unique BABE pre-runtime digest present after AURA in state 'Aura'")]
 fn baseline_rejects_blocks_with_babe_pre_digest() {
 	new_test_ext().execute_with(|| {
 		// Default state is `Aura`; a block carrying a BABE pre-digest is rejected.
 		start_block_with_babe_pre_digest(100);
 		on_initialize();
 	});
+}
+
+/// Initialize a block carrying `logs` and evaluate the AURA-then-BABE guard directly.
+fn aura_before_babe(logs: Vec<sp_runtime::DigestItem>) -> bool {
+	new_test_ext().execute_with(|| {
+		start_block_with_logs(logs);
+		ConsensusEngine::has_aura_pre_digest_before_babe_pre_digest()
+	})
+}
+
+#[test]
+fn aura_then_matching_babe_is_detected() {
+	// The rejected shape: AURA followed by a single BABE digest at the same slot.
+	assert!(aura_before_babe(vec![aura_pre_digest(100), babe_pre_digest(100)]));
+}
+
+#[test]
+fn aura_then_matching_babe_with_unrelated_digest_is_detected() {
+	// A pre-runtime digest for another engine between the two is ignored.
+	assert!(aura_before_babe(vec![
+		aura_pre_digest(100),
+		unrelated_pre_digest(),
+		babe_pre_digest(100),
+	]));
+}
+
+#[test]
+fn empty_digest_is_not_detected() {
+	assert!(!aura_before_babe(vec![]));
+}
+
+#[test]
+fn aura_only_is_not_detected() {
+	assert!(!aura_before_babe(vec![aura_pre_digest(100)]));
+}
+
+#[test]
+fn babe_only_is_not_detected() {
+	// A BABE digest with no preceding AURA digest.
+	assert!(!aura_before_babe(vec![babe_pre_digest(100)]));
+}
+
+#[test]
+fn babe_before_aura_is_not_detected() {
+	assert!(!aura_before_babe(vec![babe_pre_digest(100), aura_pre_digest(100)]));
+}
+
+#[test]
+fn babe_with_mismatched_slot_is_not_detected() {
+	assert!(!aura_before_babe(vec![aura_pre_digest(100), babe_pre_digest(101)]));
+}
+
+#[test]
+fn duplicate_babe_digest_is_not_detected() {
+	// Two BABE digests (even matching the AURA slot) are not the unique-digest shape.
+	assert!(!aura_before_babe(vec![
+		aura_pre_digest(100),
+		babe_pre_digest(100),
+		babe_pre_digest(100),
+	]));
 }
 
 #[test]
@@ -82,8 +144,9 @@ fn arm_babe_is_rejected_from_other_states() {
 			EngineState::<Test>::put(state);
 			assert_ok!(ConsensusEngine::arm_babe(RuntimeOrigin::root()));
 			assert_eq!(EngineState::<Test>::get(), state);
-			// The arm hook only fires on the real Aura -> ArmedBabe transition.
-			assert!(!BabeArmed::get());
+			// The arm hook only fires on the real Aura -> ArmedBabe transition, so BABE
+			// is never pre-seeded from these states.
+			assert_eq!(pallet_babe::GenesisSlot::<Test>::get(), Slot::from(0));
 		}
 	});
 }
@@ -129,36 +192,15 @@ fn schedule_flip_is_no_op_unless_armed() {
 }
 
 #[test]
-fn flip_commits_at_the_last_slot_of_the_epoch() {
+#[should_panic(expected = "Issue #1742 adds BABE keys to the runtime")]
+fn flip_fires_at_the_last_slot_of_the_epoch() {
 	new_test_ext().execute_with(|| {
 		EngineState::<Test>::put(State::ScheduledFlip);
 
-		// A mid-epoch block does not trigger the flip.
-		start_block_at_slot(1400);
-		on_initialize();
-		assert_eq!(EngineState::<Test>::get(), State::ScheduledFlip);
-
-		// The last slot of the epoch (1499 for a 300-slot epoch) commits the flip.
+		// The last slot of the epoch (1499 for a 300-slot epoch) attempts the flip.
+		// Completing it panics until real BABE authorities are wired in (Issue #1742).
 		start_block_at_slot(1499);
 		on_initialize();
-		assert_eq!(EngineState::<Test>::get(), State::Babe);
-		assert_eq!(ConsensusEngine::active_engine(), ActiveEngine::Babe);
-	});
-}
-
-#[test]
-fn flip_migrates_with_the_next_epoch_genesis_slot() {
-	new_test_ext().execute_with(|| {
-		EngineState::<Test>::put(State::ScheduledFlip);
-		assert_eq!(BabeMigrateGenesisSlot::get(), None);
-
-		start_block_at_slot(1499);
-		on_initialize();
-
-		assert_eq!(EngineState::<Test>::get(), State::Babe);
-		// BABE genesis is the first slot of the next epoch (1500), keeping BABE
-		// epochs aligned with the sidechain epochs.
-		assert_eq!(BabeMigrateGenesisSlot::get(), Some(Slot::from(1500)));
 	});
 }
 
@@ -166,37 +208,41 @@ fn flip_migrates_with_the_next_epoch_genesis_slot() {
 fn flip_does_not_run_mid_epoch() {
 	new_test_ext().execute_with(|| {
 		EngineState::<Test>::put(State::ScheduledFlip);
+		// A mid-epoch block does not trigger the flip (no panic, state unchanged).
 		start_block_at_slot(1400);
 		on_initialize();
 
 		assert_eq!(EngineState::<Test>::get(), State::ScheduledFlip);
-		assert_eq!(BabeMigrateGenesisSlot::get(), None);
 	});
 }
 
 #[test]
-fn flip_waits_for_next_epoch_when_the_last_slot_is_skipped() {
+fn flip_does_not_run_on_penultimate_or_first_slot_of_next_epoch() {
 	new_test_ext().execute_with(|| {
 		EngineState::<Test>::put(State::ScheduledFlip);
-		// Don't flip at penultimate slot
+		// Don't flip at the penultimate slot.
 		start_block_at_slot(1498);
 		on_initialize();
 		assert_eq!(EngineState::<Test>::get(), State::ScheduledFlip);
-		assert_eq!(BabeMigrateGenesisSlot::get(), None);
 
 		// The last slot of the epoch (1499) produced no block; the first block of
-		// the next epoch lands at 1500. The flip must NOT commit — we only flip on
+		// the next epoch lands at 1500. The flip must NOT execute — we only flip on
 		// a block seen exactly at an epoch's last slot.
 		start_block_at_slot(1500);
 		on_initialize();
 		assert_eq!(EngineState::<Test>::get(), State::ScheduledFlip);
-		assert_eq!(BabeMigrateGenesisSlot::get(), None);
+	});
+}
 
-		// It commits at the next epoch's last slot (1799), genesis slot 1800.
+#[test]
+#[should_panic(expected = "Issue #1742 adds BABE keys to the runtime")]
+fn flip_fires_at_next_epoch_last_slot_when_the_last_slot_is_skipped() {
+	new_test_ext().execute_with(|| {
+		EngineState::<Test>::put(State::ScheduledFlip);
+		// The epoch's last slot (1499) was skipped; the flip waits and fires at the
+		// next epoch's last slot (1799), where completing it panics (Issue #1742).
 		start_block_at_slot(1799);
 		on_initialize();
-		assert_eq!(EngineState::<Test>::get(), State::Babe);
-		assert_eq!(BabeMigrateGenesisSlot::get(), Some(Slot::from(1800)));
 	});
 }
 

@@ -14,8 +14,8 @@
 //! Test mock for the consensus-engine pallet.
 
 use frame_support::{
-	derive_impl, parameter_types,
-	traits::{ConstU32, ConstU64},
+	derive_impl,
+	traits::{ConstBool, ConstU32, ConstU64},
 };
 use frame_system::EnsureRoot;
 use parity_scale_codec::Encode;
@@ -31,23 +31,10 @@ use sp_runtime::{
 
 use crate as pallet_consensus_engine;
 
-parameter_types! {
-	/// Records whether the arm hook ran.
-	pub static BabeArmed: bool = false;
-	/// Records the BABE genesis slot the migration ran with, or `None` if it has not run.
-	pub static BabeMigrateGenesisSlot: Option<Slot> = None;
-}
-
-/// Test `BabeMigration` recording the arm hook and the BABE genesis slot.
-pub struct RecordingBabeMigration;
-impl pallet_consensus_engine::BabeMigration for RecordingBabeMigration {
-	fn on_arm() {
-		BabeArmed::set(true);
-	}
-	fn migrate(babe_genesis_slot: Slot) {
-		BabeMigrateGenesisSlot::set(Some(babe_genesis_slot));
-	}
-}
+/// Epoch length shared by pallet-babe and the consensus-engine pallet in the mock.
+const EPOCH_DURATION: u64 = 300;
+/// Slot duration in milliseconds used by the AURA/BABE/timestamp mock configs.
+const SLOT_DURATION: u64 = 6000;
 
 type Block = frame_system::mocking::MockBlock<Test>;
 
@@ -55,6 +42,9 @@ frame_support::construct_runtime!(
 	pub struct Test {
 		System: frame_system = 0,
 		ConsensusEngine: pallet_consensus_engine = 1,
+		Timestamp: pallet_timestamp = 2,
+		Aura: pallet_aura = 3,
+		Babe: pallet_babe = 4,
 	}
 );
 
@@ -86,39 +76,79 @@ impl frame_system::Config for Test {
 	type MaxConsumers = ConstU32<16>;
 }
 
-impl pallet_consensus_engine::Config for Test {
-	// Only root drives state transitions in the mock, mirroring the runtime's governance origin.
-	type GovernanceOrigin = EnsureRoot<u64>;
-	type EpochDuration = ConstU64<300>;
-	type BabeMigration = RecordingBabeMigration;
+#[derive_impl(pallet_timestamp::config_preludes::TestDefaultConfig)]
+impl pallet_timestamp::Config for Test {
+	type Moment = u64;
+	type OnTimestampSet = ();
+	type MinimumPeriod = ConstU64<{ SLOT_DURATION / 2 }>;
 	type WeightInfo = ();
 }
 
-fn start_block_with_logs(logs: Vec<DigestItem>) {
+impl pallet_aura::Config for Test {
+	type AuthorityId = sp_consensus_aura::sr25519::AuthorityId;
+	type DisabledValidators = ();
+	type MaxAuthorities = ConstU32<32>;
+	type AllowMultipleBlocksPerSlot = ConstBool<false>;
+	type SlotDuration = ConstU64<SLOT_DURATION>;
+}
+
+impl pallet_babe::Config for Test {
+	type EpochDuration = ConstU64<EPOCH_DURATION>;
+	type ExpectedBlockTime = ConstU64<SLOT_DURATION>;
+	type EpochChangeTrigger = pallet_babe::ExternalTrigger;
+	type DisabledValidators = ();
+	type WeightInfo = ();
+	type MaxAuthorities = ConstU32<32>;
+	type MaxNominators = ConstU32<5>;
+	type KeyOwnerProof = sp_core::Void;
+	type EquivocationReportSystem = ();
+}
+
+impl pallet_consensus_engine::Config for Test {
+	// Only root drives state transitions in the mock, mirroring the runtime's governance origin.
+	type GovernanceOrigin = EnsureRoot<u64>;
+	type EpochDuration = ConstU64<EPOCH_DURATION>;
+	type WeightInfo = ();
+}
+
+/// Start a new block whose header carries exactly the given digest `logs`.
+pub fn start_block_with_logs(logs: Vec<DigestItem>) {
 	let number = System::block_number() + 1;
 	System::initialize(&number, &Default::default(), &Digest { logs });
+}
+
+/// An AURA pre-runtime digest item for `slot`.
+pub fn aura_pre_digest(slot: u64) -> DigestItem {
+	DigestItem::PreRuntime(AURA_ENGINE_ID, Slot::from(slot).encode())
+}
+
+/// A BABE (secondary plain) pre-runtime digest item for `slot`.
+pub fn babe_pre_digest(slot: u64) -> DigestItem {
+	DigestItem::PreRuntime(
+		BABE_ENGINE_ID,
+		BabePreDigest::SecondaryPlain(SecondaryPlainPreDigest {
+			authority_index: 0,
+			slot: Slot::from(slot),
+		})
+		.encode(),
+	)
+}
+
+/// A pre-runtime digest item for an unrelated engine, which the pallet must ignore.
+pub fn unrelated_pre_digest() -> DigestItem {
+	DigestItem::PreRuntime(*b"test", Vec::new())
 }
 
 /// Start a new block whose header carries an AURA pre-runtime digest for `slot`,
 /// mirroring how the pallet reads the current slot in `on_initialize`.
 pub fn start_block_at_slot(slot: u64) {
-	start_block_with_logs(vec![DigestItem::PreRuntime(AURA_ENGINE_ID, Slot::from(slot).encode())]);
+	start_block_with_logs(vec![aura_pre_digest(slot)]);
 }
 
 /// Start a new block whose header carries a BABE pre-runtime digest (alongside
-/// the AURA one), simulating a node that emits BABE digests too early.
+/// the AURA one, at the same slot), simulating a node that emits BABE digests too early.
 pub fn start_block_with_babe_pre_digest(slot: u64) {
-	start_block_with_logs(vec![
-		DigestItem::PreRuntime(AURA_ENGINE_ID, Slot::from(slot).encode()),
-		DigestItem::PreRuntime(
-			BABE_ENGINE_ID,
-			BabePreDigest::SecondaryPlain(SecondaryPlainPreDigest {
-				authority_index: 0,
-				slot: Slot::from(slot),
-			})
-			.encode(),
-		),
-	]);
+	start_block_with_logs(vec![aura_pre_digest(slot), babe_pre_digest(slot)]);
 }
 
 pub fn new_test_ext() -> sp_io::TestExternalities {
